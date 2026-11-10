@@ -106,6 +106,8 @@ func registerAppFlags(fs *flag.FlagSet, cfg *appConfig) {
 	utils.StringFlagEnv(fs, &cfg.Relay.HTTPRedirect.Addr, "http-redirect-addr", types.DefaultHTTPRedirectAddr, "HTTP redirect listen address when enabled", "HTTP_REDIRECT_ADDR")
 	utils.BoolFlagEnv(fs, &cfg.Relay.HTTPRedirect.HSTS, "http-redirect-hsts", false, "include HSTS max-age=31536000 on redirects; browsers ignore HSTS received over HTTP", "HTTP_REDIRECT_HSTS")
 	utils.IntFlagEnv(fs, &cfg.Relay.SNIPort, "sni-port", 0, utils.ParsePortNumber, "local TCP SNI router listen port (0 follows the PORTAL_URL port when it names one, else 443)", "SNI_PORT")
+	utils.IntFlagEnv(fs, &cfg.Relay.TenantTLSRate, "tenant-tls-rate", 0, nil, "new tenant TLS connections admitted per second (0 disables the queue)", "TENANT_TLS_RATE")
+	utils.StringFlagEnv(fs, &cfg.Relay.TenantWaitPage, "tenant-wait-page", "", "self-contained HTML file served to browser navigations rejected by the tenant TLS queue", "TENANT_WAIT_PAGE")
 	utils.BoolFlagEnv(fs, &cfg.TrustProxyHeaders, "trust-proxy-headers", false, "trust X-Forwarded-* and X-Real-IP headers from trusted proxies", "TRUST_PROXY_HEADERS")
 	utils.StringFlagEnv(fs, &cfg.TrustedProxyCIDRs, "trusted-proxy-cidrs", "", "explicit trusted proxy CIDR allowlist for forwarded headers, comma-separated; empty trusts no proxies", "TRUSTED_PROXY_CIDRS")
 
@@ -158,6 +160,7 @@ func runServeCommand(args []string) error {
 		Str("release_version", types.ReleaseVersion).
 		Str("state_dir", cfg.Relay.StateDir).
 		Int("sni_port", utils.IntOrDefault(cfg.Relay.SNIPort, portal.DefaultSNIPort(cfg.Relay.PortalURL))).
+		Int("tenant_tls_rate", cfg.Relay.TenantTLSRate).
 		Msg("starting relay server")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)

@@ -108,9 +108,13 @@ type ServerConfig struct {
 	SNIPort          int
 	HTTPRedirect     types.HTTPRedirectConfig
 	SNIListenAddr    string
-	MinPort          int
-	MaxPort          int
-	ACME             acme.Config
+	// TenantTLSRate limits how many new tenant TLS connections start per second.
+	// Zero disables the queue.
+	TenantTLSRate  int
+	TenantWaitPage string
+	MinPort        int
+	MaxPort        int
+	ACME           acme.Config
 
 	// ApplicationOwnsDomainReport delegates types.PathSDKDomain to the
 	// application handler, which can compose Server.DomainReport() itself.
@@ -160,6 +164,13 @@ func NormalizeHTTPRedirectConfig(cfg types.HTTPRedirectConfig, portalURL string)
 // ValidateServerConfig normalizes server configuration and checks the
 // side-effect-free invariants required before runtime resources are created.
 func ValidateServerConfig(cfg ServerConfig) (ServerConfig, error) {
+	if cfg.TenantTLSRate < 0 {
+		return ServerConfig{}, errors.New("tenant TLS rate must be zero or positive")
+	}
+	cfg.TenantWaitPage = strings.TrimSpace(cfg.TenantWaitPage)
+	if cfg.TenantWaitPage != "" && cfg.TenantTLSRate == 0 {
+		return ServerConfig{}, errors.New("tenant waiting page requires a positive tenant TLS rate")
+	}
 	cfg.IVNPConfigPath = strings.TrimSpace(cfg.IVNPConfigPath)
 	if cfg.IVNPConfigPath != "" && !cfg.DiscoveryEnabled {
 		return ServerConfig{}, errors.New("relay overlay requires discovery")
@@ -414,6 +425,10 @@ func (s *Server) start(ctx context.Context, apiHandler http.Handler) error {
 		return errors.New("server already started")
 	}
 	cfg := s.config()
+	waitingPage, err := loadTenantWaitPage(cfg.TenantWaitPage)
+	if err != nil {
+		return err
+	}
 	cacheManager, cacheErr := cache.New(cfg.Cache, filepath.Join(cfg.StateDir, "static-cache"))
 	if cacheErr != nil {
 		log.Warn().Err(cacheErr).Msg("relay cache unavailable; using origin tunnels")
@@ -533,7 +548,15 @@ func (s *Server) start(ctx context.Context, apiHandler http.Handler) error {
 			return err
 		})
 	}
-	group.Go(func() error { return s.runPublicIngress(groupCtx) })
+	var tenantQueue *tenantTLSQueue
+	if cfg.TenantTLSRate > 0 {
+		tenantQueue = newTenantTLSQueue(cfg.TenantTLSRate)
+		group.Go(func() error {
+			tenantQueue.run(groupCtx)
+			return nil
+		})
+	}
+	group.Go(func() error { return s.runPublicIngress(groupCtx, tenantQueue, waitingPage, apiTLS) })
 	if s.quicBackhaul != nil {
 		s.quicBackhaulDone = make(chan struct{})
 		group.Go(func() error {
@@ -949,7 +972,7 @@ func (s *Server) closeIngress() {
 	}
 }
 
-func (s *Server) runPublicIngress(ctx context.Context) error {
+func (s *Server) runPublicIngress(ctx context.Context, queue *tenantTLSQueue, waitingPage *tenantWaitPage, apiTLS *tls.Config) error {
 	for {
 		conn, err := s.sniListener.Accept()
 		switch {
@@ -958,56 +981,7 @@ func (s *Server) runPublicIngress(ctx context.Context) error {
 				_ = conn.Close()
 				continue
 			}
-			go func(conn net.Conn) {
-				inspecting := true
-				defer func() { s.releaseIngress(conn, inspecting) }()
-				clientHello, wrappedConn, err := l4.InspectClientHello(conn, defaultClientHelloWait)
-				if err != nil {
-					if wrappedConn != nil {
-						_ = wrappedConn.Close()
-					} else {
-						_ = conn.Close()
-					}
-					return
-				}
-				helloSpan := clientHello.HandshakeMessage
-
-				serverName := utils.NormalizeHostname(clientHello.ServerName)
-				// Go omits the SNI extension for IP-literal hosts and tenant
-				// hostnames are always DNS names, so a connection without a server
-				// name targets the canonical root origin; route it there instead
-				// of failing the handshake for IP-literal PORTAL_URL deployments.
-				if serverName == "" || serverName == s.identity.Name || s.registry.cache.Has(serverName) {
-					select {
-					case s.apiHandoff.conns <- wrappedConn:
-					case <-s.apiHandoff.done:
-						_ = wrappedConn.Close()
-					case <-ctx.Done():
-						_ = wrappedConn.Close()
-					}
-					return
-				}
-
-				if !s.promoteIngress() {
-					_ = wrappedConn.Close()
-					return
-				}
-				inspecting = false
-				record, ok := s.registry.Lookup(serverName)
-				if !ok {
-					log.Warn().
-						Str("server_name", serverName).
-						Str("remote_addr", wrappedConn.RemoteAddr().String()).
-						Msg("unknown public ingress hostname")
-					_ = wrappedConn.Close()
-					return
-				}
-				if err := s.bridgeLeaseConn(ctx, wrappedConn, record, helloSpan); err != nil {
-					log.Warn().Err(err).Msg("bridge public ingress")
-					_ = wrappedConn.Close()
-					return
-				}
-			}(conn)
+			go s.handlePublicIngress(ctx, conn, queue, waitingPage, apiTLS)
 		case errors.Is(err, net.ErrClosed):
 			return nil
 		default:
@@ -1016,6 +990,66 @@ func (s *Server) runPublicIngress(ctx context.Context) error {
 			}
 			return fmt.Errorf("accept sni connection: %w", err)
 		}
+	}
+}
+
+func (s *Server) handlePublicIngress(ctx context.Context, conn net.Conn, queue *tenantTLSQueue, waitingPage *tenantWaitPage, apiTLS *tls.Config) {
+	inspecting := true
+	defer func() { s.releaseIngress(conn, inspecting) }()
+	clientHello, wrappedConn, err := l4.InspectClientHello(conn, defaultClientHelloWait)
+	if err != nil {
+		if wrappedConn != nil {
+			_ = wrappedConn.Close()
+		} else {
+			_ = conn.Close()
+		}
+		return
+	}
+
+	serverName := utils.NormalizeHostname(clientHello.ServerName)
+	// SNI가 없는 IP 주소 접속과 릴레이 자체 호스트는 제어 API로 전달한다.
+	root := serverName == "" || serverName == s.identity.Name
+	cached := !root && s.registry.cache.Has(serverName)
+	var record *leaseRecord
+	if !root && (!cached || queue != nil) {
+		if !s.promoteIngress() {
+			_ = wrappedConn.Close()
+			return
+		}
+		inspecting = false
+		if !cached {
+			var ok bool
+			record, ok = s.registry.Lookup(serverName)
+			if !ok {
+				log.Warn().
+					Str("server_name", serverName).
+					Str("remote_addr", wrappedConn.RemoteAddr().String()).
+					Msg("unknown public ingress hostname")
+				_ = wrappedConn.Close()
+				return
+			}
+		}
+		if queue != nil && !queue.wait(ctx) {
+			defer wrappedConn.Close()
+			if waitingPage != nil && ctx.Err() == nil {
+				waitingPage.serve(ctx, wrappedConn, apiTLS, serverName)
+			}
+			return
+		}
+	}
+	if root || cached {
+		select {
+		case s.apiHandoff.conns <- wrappedConn:
+		case <-s.apiHandoff.done:
+			_ = wrappedConn.Close()
+		case <-ctx.Done():
+			_ = wrappedConn.Close()
+		}
+		return
+	}
+	if err := s.bridgeLeaseConn(ctx, wrappedConn, record, clientHello.HandshakeMessage); err != nil {
+		log.Warn().Err(err).Msg("bridge public ingress")
+		_ = wrappedConn.Close()
 	}
 }
 

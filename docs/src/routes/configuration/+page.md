@@ -84,6 +84,25 @@ A value that cannot be parsed is a startup error rather than a silent fallback:
 | `PORTAL_FRONTEND_DIR` | `""` | string | Custom SPA directory containing `index.html`; empty uses the frontend embedded in the Portal binary |
 | `IDENTITY_PATH` | `./.portal-certs` | string | Directory path for relay identity, policy state, and TLS materials |
 | `SNI_PORT` | `PORTAL_URL` port, else `443` | int | Local TCP SNI router listen port; an unset value follows the explicit `PORTAL_URL` port when it names one, and it never changes the public port advertised from `PORTAL_URL` |
+| `TENANT_TLS_RATE` | `0` | int | New tenant HTTPS connections admitted per second. Zero disables the queue. |
+| `TENANT_WAIT_PAGE` | `""` | string | Path to a self-contained HTML waiting page. Requires a positive `TENANT_TLS_RATE`. |
+
+A positive `TENANT_TLS_RATE` paces new connections for routed and cached tenant
+sites after ClientHello inspection and before continuing the TLS handshake.
+The queue allows an initial burst of up to 16
+connections, or the configured rate when it is lower. It holds up to 128
+connections for at most 750 ms each.
+Requests on established connections and connections to the relay's own hostname
+bypass this queue.
+
+When the queue fills or a connection reaches the wait limit, Portal can serve
+the optional waiting page with HTTP 503 and `Retry-After`. The page must be a
+regular file of at most 32 KiB. Put `{{retry_seconds}}` in the refresh interval
+so the browser retries after the same 5 to 8 seconds as the response header.
+Portal serves the page only for browser GET navigations. Other requests receive
+a plain HTTP 503. A separate limit caps these responses at 120 new connections
+per second and 32 in flight. Portal closes the socket if the page is disabled
+or that limit is reached.
 
 `PORTAL_URL` owns public semantics and `SNI_PORT` owns local bind semantics.
 Portal derives tenant URLs, reverse endpoints, and QUIC connection metadata
